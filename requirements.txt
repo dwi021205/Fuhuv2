@@ -1,0 +1,13 @@
+discord.py
+dnspython
+psutil
+pymongo
+pytz
+requests
+speedtest_cli
+certifi
+curl_cffi
+uvloop
+aiohttp_socks
+aiohttp
+diskcache

@@ -1,0 +1,23 @@
+{
+  "bot_token": "token bot",
+  "owner_id": "owner id",
+  "mongo_uri": "mongodb url database untuk backup harian",
+  "global_img_url": "iamge banner",
+  "global_footer_icon": "footer banner",
+  "global_footer": "footer name",
+  "global_color": "color embed",
+  "urlwebhook": [
+    "url webhook 1",
+    "url webhook 2",
+    "url webhook 3"
+  ],
+  "logbot": "log status bot",
+  "mongo_backup_enabled": true, // jika tidak ingin backup
+  "midtrans": {
+    "server_key": "",
+    "client_key": "" //(midtrans konfigurasi kalian)
+  },
+  "shop": {
+    "log_webhook": "log webhook shop buy"
+  }
+}
