@@ -1,6 +1,6 @@
 {
-  "bot_token": "token bot",
-  "owner_id": "owner id",
+  "bot_token": "MTQ0Mjk4MzA3NTMzMDkyMDU4MA.G-N1Rr.zoQ1I7PGD7KoE4HoHAK9rUK1stDl4TU-pLkCM4",
+  "owner_id": "759647283456901132",
   "mongo_uri": "mongodb url database untuk backup harian",
   "global_img_url": "image banner",
   "global_footer_icon": "footer banner",
