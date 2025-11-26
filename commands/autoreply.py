@@ -1,414 +1,1050 @@
-import copy
-import aiohttp
-import discord
-from discord import ui, app_commands
-from discord.ext import commands
-from datetime import datetime, timezone
 import asyncio
+import contextlib
+import gc
+import random
+import time
+import sys
+import threading
+from collections import deque
+from typing import Optional, Dict, Any, List, Tuple
+import ctypes
 
-from database import get_db, run_db
-from handler.autoreply import get_autoreply_manager
-from commands.utils import ensure_active_subscription
+import selfcord
+from selfcord.errors import HTTPException, Forbidden, NotFound, LoginFailure
+from selfcord.http import HTTPClient, MultipartParameters
 
-async def _fetch_account_identity(session: aiohttp.ClientSession, token: str):
-    if not token:
-        return None, None
-    headers = {"Authorization": token, "User-Agent": "Mozilla/5.0"}
+from database import get_db
+
+sys.setrecursionlimit(1000)
+
+
+async def _run_gc_in_thread(generation: int = 1):
     try:
-        async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as res:
-            if res.status == 200:
-                data = await res.json(content_type=None)
-                return data.get('username'), data.get('id')
-    except aiohttp.ClientError:
+        await asyncio.to_thread(gc.collect, generation)
+    except Exception:
         pass
-    return None, None
-
-async def validate_all_accounts_concurrent_for_autoreply(accounts: list):
-    if not accounts:
-        return []
-
-    timeout = aiohttp.ClientTimeout(total=6)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        tasks = [_fetch_account_identity(session, acc.get('token', '')) for acc in accounts]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    validated_accounts = []
-    for account, res in zip(accounts, results):
-        account_copy = copy.deepcopy(account)
-        if isinstance(res, Exception) or not res or not res[0]:
-            account_copy['_validation_status'] = 'invalid'
-        else:
-            account_copy['_validation_status'] = 'valid'
-        validated_accounts.append(account_copy)
-
-    return validated_accounts
 
 
-class SettingsModal(ui.Modal, title='Auto Reply Settings'):
-    def __init__(self, bot, user_id: str, account: dict, view):
-        super().__init__(timeout=None)
-        self.bot = bot
-        self.db = get_db()
-        self.user_id = user_id
-        self.account = account
-        self.parent_view = view
-
-        autoreply_config = self.account.get('autoreply', {})
-        max_length = 4000 if self.account.get('is_nitro') else 2000
-
-        self.presence_input = ui.TextInput(
-            label="Presence",
-            placeholder="online / idle / dnd / invisible",
-            default=autoreply_config.get('presence', 'online'),
-            required=True
-        )
-        self.message_input = ui.TextInput(
-            label="Message",
-            style=discord.TextStyle.paragraph,
-            placeholder="Enter the auto-reply message.",
-            default=autoreply_config.get('message', ''),
-            max_length=max_length,
-            required=True
-        )
-
-        self.add_item(self.presence_input)
-        self.add_item(self.message_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        presence = self.presence_input.value.lower()
-        if presence not in ["online", "idle", "dnd", "invisible"]:
-            await interaction.edit_original_response(content="<:exclamation:1426164277638594680> Invalid presence value. Please use one of: `online`, `idle`, `dnd`, `invisible`.")
-            return
-
-        new_config = {
-            "presence": presence,
-            "message": self.message_input.value,
-        }
-
-        await run_db(self.db.update_account_autoreply_settings, self.user_id, self.account['token'], new_config)
-
-        updated_user_config = await run_db(self.db.get_user, self.user_id)
-        updated_account = next((acc for acc in updated_user_config['accounts'] if acc['token'] == self.account['token']), None)
-
-        if updated_account:
-            self.parent_view.account = updated_account
-            embed = self.parent_view.create_embed()
-            await interaction.edit_original_response(embed=embed, view=self.parent_view)
-        else:
-            await interaction.edit_original_response(content="Settings updated successfully.")
-
-class AutoReplyControlView(ui.View):
-    def __init__(self, bot, user_id: str, account: dict):
-        super().__init__(timeout=180)
-        self.bot = bot
-        self.user_id = user_id
-        self.account = account
-        self.update_buttons()
-
-    def create_embed(self) -> discord.Embed:
-        config = self.bot.config
-        autoreply_config = self.account.get('autoreply', {})
-        status = "Online" if autoreply_config.get('isactive') else "Offline"
+class AutoReplyClient:
+    def __init__(self, owner_id: str, account_cfg: dict, manager):
+        self.owner_id = owner_id
+        self.account_cfg = account_cfg
+        self.manager = manager
+        self.token = account_cfg.get("token", "")
+        self._tag = f"[{account_cfg.get('username', 'Unknown')}]"
         
-        embed = discord.Embed(
-            title="Auto Reply Control & Setup <:selophone:1426164287360995389>",
-            description="Manage and run your auto-reply settings.",
-            color=config.get('global_color'),
-            timestamp=datetime.now(timezone.utc)
-        )
-        if self.account.get('profile_url'):
-            embed.set_thumbnail(url=self.account['profile_url'])
-
-        def truncate(s: str, length: int) -> str:
-            if not s: return "Not Set"
-            return (s[:length] + '...') if len(s) > length else s
-
-        value = f"**<:dot:1426148484146270269> Status**: {status}\n"
-        value += f"**<:dot:1426148484146270269> Presence**: {autoreply_config.get('presence', 'Not Set').capitalize()}\n"
-
-        msg = autoreply_config.get('message')
-        if msg:
-            value += f"**<:dot:1426148484146270269> Message**:\n```{truncate(msg, 50)}```\n"
-
-        embed.add_field(name="Configuration & Status <:clover:1426170416606478437>", value=value, inline=False)
-        embed.set_footer(text=config.get('global_footer', ''), icon_url=config.get('global_footer_icon', ''))
-        img_url = config.get('global_img_url')
-        if img_url:
-            embed.set_image(url=img_url)
-
-        return embed
-
-    def update_buttons(self):
-        self.clear_items()
-
-        is_active = self.account.get('autoreply', {}).get('isactive', False)
-
-        if is_active:
-            toggle_button = ui.Button(style=discord.ButtonStyle.danger, label="Stop", emoji="<:stop:1426170394792169502>")
-        else:
-            toggle_button = ui.Button(style=discord.ButtonStyle.success, label="Start", emoji="<:start:1426170397581250570>")
-        toggle_button.callback = self.toggle_callback
-        self.add_item(toggle_button)
-
-        settings_button = ui.Button(style=discord.ButtonStyle.secondary, label="Settings", emoji="<:edit:1426170391218487349>")
-        settings_button.callback = self.settings_callback
-        self.add_item(settings_button)
-
-        reset_button = ui.Button(style=discord.ButtonStyle.secondary, label="Reset Replied", emoji="<:delete:1426170386734911578>")
-        reset_button.callback = self.reset_callback
-        self.add_item(reset_button)
-
-    async def settings_callback(self, interaction: discord.Interaction):
-        modal = SettingsModal(self.bot, self.user_id, self.account, self)
-        await interaction.response.send_modal(modal)
+        self.client: Optional[selfcord.Client] = None
+        self.http: Optional[HTTPClient] = None
+        self.self_user_id: Optional[int] = None
+        self._running = False
+        self._stopped = False
+        self._stopping_in_progress = False
+        self._stop_reason = "normal"
         
-    async def reset_callback(self, interaction: discord.Interaction):
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True)
-        db = get_db()
-        await run_db(db.reset_replied_list_for_account, self.user_id, self.account['token'])
-        await interaction.followup.send("<:green:1426180913083191377> Successfully cleared the replied user list for this account.", ephemeral=True)
-
-    async def toggle_callback(self, interaction: discord.Interaction):
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True)
-        manager = get_autoreply_manager()
-        if not manager:
-            await interaction.followup.send("<:exclamation:1426164277638594680> Autoreply manager is not available right now. Please try again in a moment.", ephemeral=True)
-            return
-        is_currently_active = self.account.get('autoreply', {}).get('isactive', False)
-        desired_state = not is_currently_active
-        action_success = True
-
-        if is_currently_active:
-            async def _stop_wrapper():
-                try:
-                    await manager.stop_task(self.user_id, self.account['token'])
-                except Exception:
-                    pass
-            asyncio.create_task(_stop_wrapper())
+        ar_cfg = account_cfg.get("autoreply", {})
+        self.autoreply_message = ar_cfg.get("message", "")
+        self._replied_cache = set(ar_cfg.get("replied", []))
+        self._error_cache = set(ar_cfg.get("error", []))
+        
+        presence_str = ar_cfg.get("presence", "online").lower()
+        if presence_str == "dnd":
+            self.presence_status = selfcord.Status.dnd
+        elif presence_str == "idle":
+            self.presence_status = selfcord.Status.idle
+        elif presence_str == "invisible":
+            self.presence_status = selfcord.Status.invisible
         else:
-            autoreply_conf = self.account.get('autoreply', {}) or {}
-            if not autoreply_conf.get('message'):
-                try:
-                    await interaction.followup.send("<:exclamation:1426164277638594680> Pls configure auto reply config", ephemeral=True)
-                except Exception:
-                    pass
-                return
-            try:
-                action_success = await manager.start_task(self.user_id, self.account)
-            except Exception:
-                action_success = False
-            
-            if not action_success:
-                await interaction.followup.send("<:exclamation:1426164277638594680> Failed to start autoreply for this account. Please check the token or try again later.", ephemeral=True)
-                return
-        db = get_db()
-        await run_db(db.update_autoreply_status, self.user_id, self.account['token'], desired_state)
-        updated_user_config = await run_db(db.get_user, self.user_id)
-        if updated_user_config:
-            self.account = next((acc for acc in updated_user_config.get('accounts', []) if acc['token'] == self.account['token']), self.account)
-
-        self.update_buttons()
-        embed = self.create_embed()
-        await interaction.edit_original_response(content=None, embed=embed, view=self)
-
-class AccountSelectionViewForAutoReply(ui.View):
-    def __init__(self, bot, original_interaction: discord.Interaction, accounts: list | None = None):
-        super().__init__(timeout=180)
-        self.bot = bot
-        self.original_interaction = original_interaction
-        self.user_id = str(original_interaction.user.id)
-        self.accounts = accounts or []
-        self.current_page = 0
-        self.items_per_page = 25
-
-    async def update_components(self):
-        self.clear_items()
-
-        if not self.accounts or not isinstance(self.accounts, list):
-            self.accounts = []
-
-        if len(self.accounts) == 0:
-            placeholder_option = discord.SelectOption(
-                label="No accounts available",
-                value="none",
-                description="No accounts found",
-                emoji="<:exclamation:1426164277638594680>"
-            )
-            select = ui.Select(placeholder="No accounts to select", options=[placeholder_option], disabled=True)
-            self.add_item(select)
-            return
-
-        start_index = self.current_page * self.items_per_page
-        end_index = start_index + self.items_per_page
-        accounts_on_page = self.accounts[start_index:end_index]
-
-        options = []
-        for idx, acc in enumerate(accounts_on_page):
-            abs_index = start_index + idx
-            validation_status = acc.get('_validation_status', 'unknown')
-            if validation_status == 'valid':
-                status_emoji = "<:green:1426180913083191377>"
-                status_text = "Valid"
-            else:
-                status_emoji = "<:red:1426180916446761031>"
-                status_text = "Invalid"
-
-            description = f"Status: {status_text} | ID: {acc['user_id']}"
-            options.append(discord.SelectOption(
-                label=acc['username'],
-                value=f"accidx:{abs_index}",
-                description=description,
-                emoji=status_emoji
-            ))
-
-        if not options:
-            placeholder_option = discord.SelectOption(
-                label="No accounts on this page",
-                value="none",
-                description="No accounts available on this page",
-                emoji="<:exclamation:1426164277638594680>"
-            )
-            select = ui.Select(placeholder="No accounts on this page", options=[placeholder_option], disabled=True)
-            self.add_item(select)
-            return
-
-        total_pages = (len(self.accounts) + self.items_per_page - 1) // self.items_per_page
-        placeholder = "Select Account Here"
-        if total_pages > 1:
-            placeholder = f"Select Account Here {self.current_page + 1}/{total_pages}"
-
-        select = ui.Select(placeholder=placeholder, options=options)
-        select.callback = self.handle_selection
-        self.add_item(select)
-
-        if len(self.accounts) > self.items_per_page:
-            prev_button = ui.Button(label="Previous", emoji="<:left:1426148440974299209>", style=discord.ButtonStyle.secondary, disabled=self.current_page == 0)
-            prev_button.callback = self.prev_page
-            next_button = ui.Button(label="Next", emoji="<:right:1426148437836955658>", style=discord.ButtonStyle.secondary, disabled=end_index >= len(self.accounts))
-            next_button.callback = self.next_page
-            self.add_item(prev_button)
-            self.add_item(next_button)
-
-    async def prev_page(self, interaction: discord.Interaction):
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True)
-        self.current_page -= 1
-        await self.update_components()
-        await interaction.edit_original_response(view=self)
-
-    async def next_page(self, interaction: discord.Interaction):
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True)
-        self.current_page += 1
-        await self.update_components()
-        await interaction.edit_original_response(view=self)
-
-    @classmethod
-    async def create(cls, bot, interaction: discord.Interaction):
+            self.presence_status = selfcord.Status.online
+        
+        self._message_queue = deque()
+        self._process_task: Optional[asyncio.Task] = None
+        self._gc_task: Optional[asyncio.Task] = None
+        self._runner_task: Optional[asyncio.Task] = None
+        self._ready_event: Optional[asyncio.Event] = None
+        self._background_tasks_started = False
+        self._max_gateway_attempts = 5
+        self._gateway_backoff_base = 8
+        self._internal_reconnect_enabled = True
+        
+        self._rate_limit_until = 0
+        
+        self._manager_notified = False
+        self._setup_malloc_trim()
+    
+    def _setup_malloc_trim(self):
         try:
-            if not interaction.response.is_done():
-                await interaction.response.defer(ephemeral=True)
+            self.libc = ctypes.CDLL("libc.so.6")
+            self.malloc_trim = self.libc.malloc_trim
+            self.malloc_trim.argtypes = [ctypes.c_size_t]
+            self.malloc_trim.restype = ctypes.c_int
+        except:
+            self.libc = None
+            self.malloc_trim = None
+    
+    def _disable_internal_reconnect(self):
+        self._internal_reconnect_enabled = False
+    
+    def _should_use_internal_reconnect(self) -> bool:
+        if not self._internal_reconnect_enabled:
+            return False
+        if self._stop_reason in {"manual", "login_failure", "manager_stopped", "max_retries"}:
+            return False
+        return True
 
+    def _ensure_background_tasks(self):
+        if self._process_task is None or self._process_task.done():
+            self._process_task = asyncio.create_task(self._process_message_queue())
+        if self._gc_task is None or self._gc_task.done():
+            self._gc_task = asyncio.create_task(self._periodic_gc())
+        self._background_tasks_started = True
+    
+    def _create_gateway_client(self) -> selfcord.Client:
+        client = selfcord.Client(
+            chunk_guilds_at_startup=False,
+            guild_subscriptions=False,
+            fetch_offline_members=False,
+            max_messages=0,
+            heartbeat_timeout=60,
+            guild_ready_timeout=2
+        )
+        
+        @client.event
+        async def on_ready():
+            if self._stopped or not self._running:
+                return
+            
+            await self._update_presence()
+            if self._ready_event and not self._ready_event.is_set():
+                self._ready_event.set()
+            self._ensure_background_tasks()
+        
+        @client.event
+        async def on_relationship_add(relationship):
+            if self._stopped or not self._running:
+                return
+            
+            if relationship.type.value == 3:
+                channel_id = str(relationship.user.dm_channel.id if relationship.user.dm_channel else relationship.user.id)
+                if channel_id not in self._replied_cache and channel_id not in self._error_cache:
+                    self._message_queue.append(channel_id)
+        
+        @client.event
+        async def on_message(message):
+            if self._stopped or not self._running:
+                return
+            
+            if client.user and message.author == client.user:
+                return
+            
+            if not isinstance(message.channel, selfcord.DMChannel):
+                return
+            
+            channel_id = str(message.channel.id)
+            if channel_id not in self._replied_cache and channel_id not in self._error_cache:
+                self._message_queue.append(channel_id)
+        
+        return client
+    
+    async def _wait_for_gateway_ready(self):
+        event = self._ready_event
+        if not event:
+            await asyncio.sleep(0.5)
+            return
+        try:
+            await asyncio.wait_for(event.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+    
+    async def _run_gateway_with_reconnect(self):
+        attempt = 0
+        while self._running and not self._stopped:
+            self.client = self._create_gateway_client()
+            try:
+                allow_reconnect = self._should_use_internal_reconnect()
+                await self.client.start(self.token, reconnect=allow_reconnect)
+                break
+            except LoginFailure:
+                self._stop_reason = "login_failure"
+                self._disable_internal_reconnect()
+                raise
+            except asyncio.CancelledError:
+                raise
+            except (selfcord.GatewayNotFound, selfcord.ConnectionClosed, HTTPException, OSError) as exc:
+                attempt += 1
+                self._stop_reason = "error"
+                if attempt >= self._max_gateway_attempts:
+                    self._stop_reason = "max_retries"
+                    self._disable_internal_reconnect()
+                    raise
+                backoff = min(self._gateway_backoff_base * attempt, 30)
+                await asyncio.sleep(backoff)
+            except Exception:
+                attempt += 1
+                self._stop_reason = "error"
+                if attempt >= self._max_gateway_attempts:
+                    self._stop_reason = "max_retries"
+                    self._disable_internal_reconnect()
+                    raise
+                backoff = min(self._gateway_backoff_base * attempt, 30)
+                await asyncio.sleep(backoff)
+            finally:
+                if self._ready_event:
+                    self._ready_event.clear()
+                await self._close_gateway_client()
+
+    def _retry_after_from_exception(self, exc) -> float:
+        retry_after = getattr(exc, 'retry_after', None)
+        if retry_after:
+            try:
+                return float(retry_after)
+            except (TypeError, ValueError):
+                pass
+        response = getattr(exc, 'response', None)
+        headers = getattr(response, 'headers', {}) if response else {}
+        for key in ("Retry-After", "X-RateLimit-Reset-After"):
+            value = headers.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 1.0
+    
+    async def _optimize_memory(self):
+        await _run_gc_in_thread(1)
+        
+        if self.malloc_trim:
+            try:
+                await asyncio.to_thread(self.malloc_trim, 0)
+            except Exception:
+                pass
+    
+    async def reset_cache(self):
+        self._replied_cache.clear()
+        self._error_cache.clear()
+        await self._sync_cache_from_db()
+    
+    async def _sync_cache_from_db(self):
+        try:
             db = get_db()
-            user_config = await run_db(db.get_user, interaction.user.id)
-            accounts = user_config.get('accounts', []) if user_config else []
-            if not accounts:
-                await interaction.edit_original_response(content="<:exclamation:1426164277638594680> No Account Configured Using Command `/account` & Use Button `Add Account` to added the account", embed=None, view=None)
+
+            def _sync_read():
+                user = db.get_user(self.owner_id)
+                if not user:
+                    return None
+                
+                for acc in user.get("accounts", []) or []:
+                    if acc.get("token") == self.token:
+                        return acc.get("autoreply", {})
+                return None
+
+            ar_cfg = await asyncio.to_thread(_sync_read)
+            if ar_cfg is None:
                 return
+
+            self._replied_cache = set(ar_cfg.get("replied", []))
+            self._error_cache = set(ar_cfg.get("error", []))
+            self.autoreply_message = ar_cfg.get("message", "")
             
-            validated_accounts = await validate_all_accounts_concurrent_for_autoreply(accounts)
-
-            view = cls(bot, interaction, validated_accounts if validated_accounts else [])
-            await view.update_components()
-            embed = discord.Embed(
-                title=" <:mannequin:1426148407646490624> Auto Reply Account Selection",
-                description="Please select an account to configure its auto-reply settings.",
-                color=bot.config['global_color'],
-                timestamp=datetime.now(timezone.utc)
-            )
-            embed.set_footer(text=bot.config.get('global_footer', ''), icon_url=bot.config.get('global_footer_icon', ''))
-            img_url = bot.config.get('global_img_url')
-            if img_url:
-                embed.set_image(url=img_url)
-            await interaction.edit_original_response(embed=embed, view=view)
-
-        except Exception:
-            try:
-                await interaction.edit_original_response(content="<:exclamation:1426164277638594680> An error occurred while processing your request.", embed=None, view=None)
-            except (discord.NotFound, discord.InteractionResponded):
-                pass
-
-    async def handle_selection(self, interaction: discord.Interaction):
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True)
-        sel = interaction.data['values'][0]
-
-        if sel == "none":
-            await interaction.edit_original_response(content="<:exclamation:1426164277638594680> No valid account selected.", embed=None, view=None)
+            presence_str = ar_cfg.get("presence", "online").lower()
+            if presence_str == "dnd":
+                self.presence_status = selfcord.Status.dnd
+            elif presence_str == "idle":
+                self.presence_status = selfcord.Status.idle
+            elif presence_str == "invisible":
+                self.presence_status = selfcord.Status.invisible
+            else:
+                self.presence_status = selfcord.Status.online
+        except:
+            pass
+    
+    async def _update_presence(self):
+        if not self.client or self._stopped or not self._running:
             return
-
-        acc_index = None
-        if isinstance(sel, str) and sel.startswith('accidx:'):
-            try:
-                acc_index = int(sel.split(':', 1)[1])
-            except Exception:
-                acc_index = None
-        selected_account_from_view = None
-        if acc_index is not None and 0 <= acc_index < len(self.accounts):
-            selected_account_from_view = self.accounts[acc_index]
-        else:
-            selected_account_from_view = next((acc for acc in self.accounts if acc.get('token') == sel), None)
-
-        if not selected_account_from_view:
-            await interaction.edit_original_response(content="Invalid selection.", embed=None, view=None)
-            return
-        token = selected_account_from_view['token']
-        if selected_account_from_view and selected_account_from_view.get('_validation_status') == 'invalid':
-            await interaction.edit_original_response(content="<:exclamation:1426164277638594680> Sorry, the selected account's token is invalid. Please update it using the `/account` command.", embed=None, view=None)
-            return
-
-        db = get_db()
-        user_config = await run_db(db.get_user, self.user_id)
-        if not user_config:
-            await interaction.edit_original_response(content="<:exclamation:1426164277638594680> Unable to load your account data. Please try again.", embed=None, view=None)
-            return
-        account = next((acc for acc in user_config.get('accounts', []) if acc['token'] == token), None)
-
-        if not account:
-            await interaction.edit_original_response(content="<:exclamation:1426164277638594680> Account not found. It might have been deleted.", embed=None, view=None)
-            return
-
-        view = AutoReplyControlView(self.bot, self.user_id, account)
-        embed = view.create_embed()
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
-class AutoReplyCog(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-        self.db = get_db()
-
-    @app_commands.command(name="autoreply", description="Setup and manage auto-replies for your accounts.")
-    async def autoreply(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
+        
         try:
-            user_config = await ensure_active_subscription(
-                interaction,
-                require_accounts=True
+            await self.client.change_presence(
+                status=self.presence_status,
+                afk=False
             )
-            if not user_config:
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
+    
+    async def _periodic_gc(self):
+        try:
+            while self._running and not self._stopped:
+                try:
+                    await asyncio.sleep(60)
+                    
+                    if not self._running or self._stopped:
+                        break
+                    
+                    await self._optimize_memory()
+                    
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    if not self._running or self._stopped:
+                        break
+                    await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    
+    async def _process_message_queue(self):
+        try:
+            while self._running and not self._stopped:
+                try:
+                    if not self._message_queue:
+                        await asyncio.sleep(0.5)
+                        continue
+                    
+                    channel_id = self._message_queue.popleft()
+                    
+                    if channel_id in self._replied_cache or channel_id in self._error_cache:
+                        continue
+                    
+                    current_time = time.time()
+                    if current_time < self._rate_limit_until:
+                        wait_time = self._rate_limit_until - current_time
+                        await asyncio.sleep(wait_time)
+                    
+                    if not self._running or self._stopped:
+                        break
+                    
+                    if not self.client or not (self._ready_event and self._ready_event.is_set()):
+                        self._message_queue.appendleft(channel_id)
+                        await self._wait_for_gateway_ready()
+                        continue
+                    
+                    await self._handle_dm_reply(channel_id)
+                    
+                    delay = random.uniform(3.0, 4.0)
+                    await asyncio.sleep(delay)
+                    
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    if not self._running or self._stopped:
+                        break
+                    await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    async def _send_dm_reply_http(self, channel_id: str) -> Tuple[str, float]:
+        if not self.http:
+            self._stop_reason = "error"
+            self._disable_internal_reconnect()
+            asyncio.create_task(self._safe_stop())
+            return 'fatal', 0.0
+        
+        payload = {"content": self.autoreply_message}
+        params = MultipartParameters(payload=payload, multipart=None, files=None)
+        max_retries = 3
+        attempt = 0
+        
+        while attempt < max_retries:
+            try:
+                await self.http.send_message(int(channel_id), params=params)
+                return 'ok', 0.0
+            except HTTPException as e:
+                status = getattr(e, 'status', None)
+                if status == 429:
+                    retry_after = max(1.0, self._retry_after_from_exception(e))
+                    self._rate_limit_until = time.time() + retry_after
+                    return 'rate_limited', retry_after
+                if status == 401:
+                    self._stop_reason = "login_failure"
+                    self._disable_internal_reconnect()
+                    asyncio.create_task(self._safe_stop())
+                    return 'fatal', 0.0
+                if status == 403:
+                    return 'blocked', 0.0
+                if status == 400:
+                    try:
+                        await self.http.accept_message_request(int(channel_id))
+                        await self.http.mark_message_request(int(channel_id))
+                        await asyncio.sleep(0.25)
+                    except Exception:
+                        return 'blocked', 0.0
+                    attempt += 1
+                    continue
+                attempt += 1
+                await asyncio.sleep(0.5)
+                continue
+            except Exception:
+                attempt += 1
+                await asyncio.sleep(0.5)
+                continue
+        
+        self._stop_reason = "error"
+        self._disable_internal_reconnect()
+        asyncio.create_task(self._safe_stop())
+        return 'fatal', 0.0
+
+    async def _handle_dm_reply(self, channel_id: str):
+        if self._stopped or not self.client:
+            return
+        
+        try:
+            channel = self.client.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self.client.fetch_channel(int(channel_id))
+            
+            if not isinstance(channel, selfcord.DMChannel):
                 return
             
-            await AccountSelectionViewForAutoReply.create(self.bot, interaction)
-
-        except Exception:
             try:
-                await interaction.edit_original_response(content="<:exclamation:1426164277638594680> An error occurred while processing your request.", embed=None, view=None)
-            except (discord.NotFound, discord.InteractionResponded):
+                await channel.accept()
+            except:
+                pass
+            
+            status, retry_after = await self._send_dm_reply_http(channel_id)
+            if status == 'ok':
+                self._replied_cache.add(channel_id)
+                await self._save_replied_to_db(channel_id)
+            elif status == 'rate_limited':
+                self._message_queue.appendleft(channel_id)
+            elif status in ('blocked', 'error'):
+                self._error_cache.add(channel_id)
+                await self._save_error_to_db(channel_id)
+            else:
+                return
+            
+        except selfcord.RateLimited as e:
+            retry_after = getattr(e, 'retry_after', 5.0)
+            self._rate_limit_until = time.time() + retry_after
+            self._message_queue.appendleft(channel_id)
+            
+        except (Forbidden, NotFound):
+            self._error_cache.add(channel_id)
+            await self._save_error_to_db(channel_id)
+            
+        except HTTPException as e:
+            if e.status in [401, 403]:
+                self._stop_reason = "login_failure"
+                self._disable_internal_reconnect()
+                asyncio.create_task(self._safe_stop())
+            else:
+                self._error_cache.add(channel_id)
+                await self._save_error_to_db(channel_id)
+                
+        except:
+            self._error_cache.add(channel_id)
+            await self._save_error_to_db(channel_id)
+    
+    async def _save_replied_to_db(self, channel_id: str):
+        if not self.token:
+            return
+        try:
+            db = get_db()
+        except Exception:
+            return
+
+        def _persist():
+            try:
+                if hasattr(db, "add_replied_user"):
+                    db.add_replied_user(self.owner_id, self.token, channel_id)
+                else:
+                    user = db.get_user(self.owner_id)
+                    if not user:
+                        return
+                    for acc in user.get("accounts", []) or []:
+                        if acc.get("token") == self.token:
+                            ar_cfg = acc.setdefault("autoreply", {})
+                            replied_list = ar_cfg.setdefault("replied", [])
+                            if channel_id not in replied_list:
+                                replied_list.append(channel_id)
+                            break
+                    db.add_user(user)
+            except Exception:
                 pass
 
-async def setup(bot: commands.Bot):
-    await bot.add_cog(AutoReplyCog(bot))
+        await asyncio.to_thread(_persist)
+    
+    async def _save_error_to_db(self, channel_id: str):
+        if not self.token:
+            return
+        try:
+            db = get_db()
+        except Exception:
+            return
+
+        def _persist():
+            try:
+                if hasattr(db, "add_autoreply_error"):
+                    db.add_autoreply_error(self.owner_id, self.token, channel_id)
+                else:
+                    user = db.get_user(self.owner_id)
+                    if not user:
+                        return
+                    for acc in user.get("accounts", []) or []:
+                        if acc.get("token") == self.token:
+                            ar_cfg = acc.setdefault("autoreply", {})
+                            error_list = ar_cfg.setdefault("error", [])
+                            if channel_id not in error_list:
+                                error_list.append(channel_id)
+                            break
+                    db.add_user(user)
+            except Exception:
+                pass
+
+        await asyncio.to_thread(_persist)
+    
+    async def start(self):
+        if self._running or self._stopped or self._stopping_in_progress:
+            return
+        
+        try:
+            self._running = True
+            self._stopped = False
+            self._stop_reason = "normal"
+            self._manager_notified = False
+            loop = asyncio.get_running_loop()
+            self.http = HTTPClient(loop=loop)
+            try:
+                me = await self.http.static_login(self.token)
+                self.self_user_id = int(me.get("id", 0))
+            except LoginFailure:
+                self._stop_reason = "login_failure"
+                self._disable_internal_reconnect()
+                self._running = False
+                self._stopped = True
+                await self._close_http_client()
+                asyncio.create_task(self.manager.on_client_stopped(self, "login_failure"))
+                return
+            except Exception:
+                self._running = False
+                self._stopped = True
+                await self._close_http_client()
+                return
+            
+            await self._sync_cache_from_db()
+            if self._ready_event is None:
+                self._ready_event = asyncio.Event()
+            
+            await self._run_gateway_with_reconnect()
+        except selfcord.LoginFailure:
+            self._stop_reason = "login_failure"
+            await self.stop()
+            raise
+        except Exception:
+            if self._stop_reason == "normal":
+                self._stop_reason = "error"
+            await self.stop()
+            raise
+        finally:
+            if not self._stopped:
+                await self.stop()
+    
+    async def stop(self):
+        if self._stopped or self._stopping_in_progress:
+            return
+        
+        try:
+            self._stopping_in_progress = True
+            self._running = False
+            self._stopped = True
+            
+            if self._stop_reason in ("manual", "manager_stopped"):
+                self._disable_internal_reconnect()
+            
+            if self._process_task and not self._process_task.done():
+                self._process_task.cancel()
+                try:
+                    await asyncio.wait_for(self._process_task, timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            
+            if self._gc_task and not self._gc_task.done():
+                self._gc_task.cancel()
+                try:
+                    await asyncio.wait_for(self._gc_task, timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            self._background_tasks_started = False
+            self._process_task = None
+            self._gc_task = None
+            
+            await self._close_gateway_client()
+            
+            runner_task = self._runner_task
+            if runner_task and runner_task is not asyncio.current_task():
+                if not runner_task.done():
+                    try:
+                        await asyncio.wait_for(runner_task, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        runner_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await runner_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                self._runner_task = None
+            
+            self._message_queue.clear()
+            
+            if self._ready_event:
+                self._ready_event.clear()
+            self._ready_event = None
+            
+            await self._close_http_client()
+            await _run_gc_in_thread()
+            
+        except Exception:
+            pass
+        finally:
+            self._stopping_in_progress = False
+            self._notify_manager_stop()
+
+    def _notify_manager_stop(self):
+        if self._manager_notified:
+            return
+        self._manager_notified = True
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.manager.on_client_stopped(self, self._stop_reason))
+        except RuntimeError:
+            asyncio.create_task(self.manager.on_client_stopped(self, self._stop_reason))
+    
+    async def _close_http_client(self):
+        http = self.http
+        self.http = None
+        if not http:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(http.close()), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            pass
+
+    async def _close_gateway_client(self):
+        client = self.client
+        self.client = None
+        if not client:
+            return
+        try:
+            if not client.is_closed():
+                await asyncio.wait_for(client.close(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            pass
+        http = getattr(client, "http", None)
+        if http:
+            try:
+                await asyncio.wait_for(http.close(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+
+    async def _safe_stop(self):
+        try:
+            await asyncio.wait_for(self.stop(), timeout=10.0)
+        except asyncio.TimeoutError:
+            await self.force_close()
+        except Exception:
+            await self.force_close()
+
+    async def force_close(self):
+        self._stopping_in_progress = True
+        self._running = False
+        self._stopped = True
+        try:
+            tasks = [self._process_task, self._gc_task, self._runner_task]
+            self._process_task = None
+            self._gc_task = None
+            self._runner_task = None
+            for task in tasks:
+                if task and not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+            self._message_queue.clear()
+            if self._ready_event:
+                self._ready_event.clear()
+            self._ready_event = None
+            try:
+                await self._close_gateway_client()
+            except Exception:
+                pass
+            try:
+                await self._close_http_client()
+            except Exception:
+                pass
+            await _run_gc_in_thread()
+        finally:
+            self._stopping_in_progress = False
+            self._notify_manager_stop()
+
+
+class AutoReplyManager:
+    def __init__(self, bot, config):
+        self.bot = bot
+        self.config = config
+        self.clients: Dict[str, AutoReplyClient] = {}
+        self._lock = asyncio.Lock()
+        self._started = False
+        self._stopping = False
+        self._restart_attempts: Dict[str, int] = {}
+        self._restart_delay = 10
+        self._max_restart_attempts = 5
+    
+    async def start(self):
+        if self._started:
+            return
+        
+        self._started = True
+        self._stopping = False
+        
+        try:
+            db = get_db()
+            users = await asyncio.to_thread(db.get_all_users)
+        except:
+            users = []
+        
+        for user in users:
+            if self._stopping:
+                break
+            
+            owner_id = user.get("user_id")
+            for account in user.get("accounts", []) or []:
+                if self._stopping:
+                    break
+                
+                ar = account.get("autoreply") or {}
+                if ar.get("isactive") and account.get("token"):
+                    asyncio.create_task(self.start_task(owner_id, account))
+    
+    async def stop(self):
+        if self._stopping:
+            return
+        
+        self._stopping = True
+        
+        async with self._lock:
+            clients = list(self.clients.values())
+            self.clients.clear()
+        
+        tasks = []
+        for client in clients:
+            client._stop_reason = "manager_stopped"
+            tasks.append(asyncio.create_task(self._safe_stop_client(client)))
+        
+        if tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
+            except:
+                pass
+        
+        await _run_gc_in_thread()
+    
+    async def _safe_stop_client(self, client: AutoReplyClient):
+        try:
+            await asyncio.wait_for(client.stop(), timeout=8.0)
+        except asyncio.TimeoutError:
+            await client.force_close()
+        except Exception:
+            await client.force_close()
+    
+    async def start_task(self, owner_id: str, account: dict):
+        if self._stopping:
+            return False
+        
+        token = account.get("token")
+        if not token:
+            return False
+        
+        try:
+            async with self._lock:
+                if token in self.clients:
+                    old_client = self.clients[token]
+                    old_client._stop_reason = "restarting"
+                    await self._safe_stop_client(old_client)
+                
+                client = AutoReplyClient(owner_id, account, self)
+                self.clients[token] = client
+                self._restart_attempts[token] = 0
+                
+                runner = asyncio.create_task(client.start())
+                client._runner_task = runner
+                
+                def _on_client_done(task: asyncio.Task, *, _client=client, _token=token):
+                    try:
+                        task.exception()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                    finally:
+                        if _client._runner_task is task:
+                            _client._runner_task = None
+                
+                runner.add_done_callback(_on_client_done)
+            return True
+        except Exception:
+            async with self._lock:
+                self.clients.pop(token, None)
+                self._restart_attempts.pop(token, None)
+            return False
+    
+    async def stop_task(self, owner_id: str, token: str):
+        async with self._lock:
+            client = self.clients.pop(token, None)
+        
+        if client:
+            client._stop_reason = "manual"
+            await self._safe_stop_client(client)
+        
+        self._restart_attempts.pop(token, None)
+        await _run_gc_in_thread()
+        return client is not None
+    
+    async def reset_all_caches(self):
+        async with self._lock:
+            clients = list(self.clients.values())
+        
+        for client in clients:
+            try:
+                await client.reset_cache()
+            except:
+                pass
+    
+    async def on_client_stopped(self, client: AutoReplyClient, reason: str):
+        if self._stopping:
+            return
+        
+        token = client.token
+        
+        async with self._lock:
+            current = self.clients.get(token)
+            if current is not client:
+                if reason in ("login_failure", "error", "manual", "manager_stopped", "max_retries"):
+                    self._restart_attempts.pop(token, None)
+                return
+            
+            if reason in ("manual", "login_failure", "manager_stopped", "max_retries"):
+                self.clients.pop(token, None)
+        
+        
+        if reason in ("manual", "manager_stopped"):
+            self._restart_attempts.pop(token, None)
+            return
+        
+        if reason == "login_failure":
+            await self._deactivate_autoreply(client.owner_id, token)
+            self._restart_attempts.pop(token, None)
+            return
+        
+        if not self._started or self._stopping:
+            return
+        
+        db = get_db()
+        user = await asyncio.to_thread(db.get_user, client.owner_id)
+        if not user:
+            self._restart_attempts.pop(token, None)
+            return
+        
+        account_cfg = None
+        for acc in user.get("accounts", []) or []:
+            if acc.get("token") == token:
+                account_cfg = acc
+                break
+        
+        if not account_cfg:
+            self._restart_attempts.pop(token, None)
+            return
+        
+        if not (account_cfg.get("autoreply") or {}).get("isactive"):
+            self._restart_attempts.pop(token, None)
+            return
+        
+        attempts = self._restart_attempts.get(token, 0) + 1
+        self._restart_attempts[token] = attempts
+        
+        if attempts > self._max_restart_attempts:
+            await self._deactivate_autoreply(client.owner_id, token)
+            return
+        
+        asyncio.create_task(self._restart_with_delay(client.owner_id, account_cfg, token))
+    
+    async def _restart_with_delay(self, owner_id: str, account_cfg: dict, token: str):
+        try:
+            await asyncio.sleep(self._restart_delay)
+            
+            if not self._started or self._stopping:
+                return
+            
+            await self.start_task(owner_id, account_cfg)
+        except:
+            pass
+    
+    async def _deactivate_autoreply(self, owner_id: str, token: str):
+        db = get_db()
+        
+        def _sync_deactivate():
+            user = db.get_user(owner_id)
+            if not user:
+                return
+            
+            changed = False
+            for acc in user.get("accounts", []) or []:
+                if acc.get("token") == token:
+                    ar = acc.setdefault("autoreply", {})
+                    if ar.get("isactive"):
+                        ar["isactive"] = False
+                        changed = True
+                    break
+            
+            if changed:
+                db.add_user(user)
+
+        await asyncio.to_thread(_sync_deactivate)
+        self._restart_attempts.pop(token, None)
+    
+    async def refresh_all(self):
+        if self._stopping:
+            return
+        
+        try:
+            db = get_db()
+            users = await asyncio.to_thread(db.get_all_users)
+        except:
+            users = []
+        
+        async with self._lock:
+            existing_clients = list(self.clients.values())
+            self.clients.clear()
+            self._restart_attempts.clear()
+        
+        for client in existing_clients:
+            client._stop_reason = "refreshing"
+            await self._safe_stop_client(client)
+        
+        if not self._started or self._stopping:
+            return
+        
+        for user in users:
+            if self._stopping:
+                break
+            
+            owner_id = user.get("user_id")
+            for account in user.get("accounts", []) or []:
+                if self._stopping:
+                    break
+                
+                ar = account.get("autoreply") or {}
+                if ar.get("isactive") and account.get("token"):
+                    asyncio.create_task(self.start_task(owner_id, account))
+
+
+class AutoReplyThread:
+    def __init__(self, bot, config):
+        self.bot = bot
+        self.config = config
+        self.thread = None
+        self.loop = None
+        self.manager = None
+        self._stop_event = threading.Event()
+        self._started = False
+        self._ready_event = threading.Event()
+        
+    def start(self):
+        if self._started:
+            return
+        self._started = True
+        self.thread = threading.Thread(target=self._run_thread, daemon=True, name="AutoReplyThread")
+        self.thread.start()
+        self._ready_event.wait(timeout=5.0)
+        
+    def _run_thread(self):
+        # Force selector loop to avoid uvloop + curl_cffi websocket FD errors under heavy autoreply load.
+        self.loop = asyncio.DefaultEventLoopPolicy().new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
+        try:
+            self.loop.run_until_complete(self._async_main())
+        except Exception:
+            pass
+        finally:
+            try:
+                pending = asyncio.all_tasks(self.loop)
+                for task in pending:
+                    task.cancel()
+                self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except:
+                pass
+            try:
+                self.loop.close()
+            except:
+                pass
+    
+    async def _async_main(self):
+        try:
+            self.manager = AutoReplyManager(self.bot, self.config)
+            self._ready_event.set()
+            
+            while not self._stop_event.is_set():
+                await asyncio.sleep(1)
+                
+        except Exception:
+            pass
+        finally:
+            if self.manager:
+                try:
+                    await self.manager.stop()
+                except:
+                    pass
+            self.manager = None
+    
+    def stop(self):
+        if not self._started or self._stop_event.is_set():
+            return
+        
+        self._stop_event.set()
+        
+        if self.loop and not self.loop.is_closed():
+            try:
+                if self.manager:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.manager.stop(),
+                        self.loop
+                    )
+                    try:
+                        future.result(timeout=10)
+                    except:
+                        pass
+            except:
+                pass
+        
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=5)
+
+
+_thread_instance: Optional[AutoReplyThread] = None
+
+
+def init_autoreply_manager(bot, config):
+    global _thread_instance
+    if _thread_instance is None:
+        _thread_instance = AutoReplyThread(bot, config)
+
+
+def get_autoreply_manager():
+    if _thread_instance:
+        return _thread_instance.manager
+    return None
+
+
+def get_autoreply_thread():
+    return _thread_instance
