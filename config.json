@@ -15,7 +15,7 @@
   "mongo_backup_enabled": true, 
   "midtrans": {
     "server_key": "",
-    "client_key": "", 
+    "client_key": "" 
   },
   "shop": {
     "log_webhook": "log webhook shop buy"
