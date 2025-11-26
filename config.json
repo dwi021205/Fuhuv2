@@ -1,5 +1,5 @@
 {
-  "bot_token": "token bot",
+  "bot_token": "MASUKAN_TOKEN_DISCORD_ASLI_DI_SINI",
   "owner_id": "owner id",
   "mongo_uri": "mongodb url database untuk backup harian",
   "global_img_url": "iamge banner",
