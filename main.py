@@ -123,17 +123,13 @@ if platform.system() == 'Windows':
             logger.info("Windows: Using default ProactorEventLoopPolicy.")
         except AttributeError:
             logger.warning("Warning: Could not set WindowsSelectorEventLoopPolicy")
-            
-# ==========================
-# UVLOOP DISABLED (TERMUX / ANDROID)
-# ==========================
-
-if platform.system() == "Windows":
-    # Windows tidak memakai uvloop
-    logger.info("Windows: uvloop tidak digunakan (ProactorEventLoop sudah default).")
 else:
-    # Non-Windows & Termux/Android → uvloop dimatikan
-    logger.info("uvloop disabled (skipped on this platform).")
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        logger.info("Linux/Unix: Using uvloop for faster event loop")
+    except Exception:
+        logger.exception("Failed to configure uvloop")
 
 import discord
 from discord.ext import commands, tasks
