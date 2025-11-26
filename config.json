@@ -1,24 +1,21 @@
 {
-  "bot_token": "MTQ0MjA3NTgyNDE0MzcyODg1MA.Gwszws.Tif97dTYUPGAXJhngzxYpEdi5qTy6RvkjP-eLE",
+  "bot_token": "MTQ0MzAwMzE5MzAwODA2NjcxMQ.Gj8w_0.Qn15WzkJeHMGFTHEDi4tiSAXKIvuLikpgNrEsc",
   "owner_id": "759647283456901132",
   "mongo_uri": "mongodb url database untuk backup harian",
-  "global_img_url": "image banner",
+  "global_img_url": "iamge banner",
   "global_footer_icon": "footer banner",
   "global_footer": "footer name",
-  "global_color": "0",
-
-  "autoreply_message": "Halo! Terima kasih sudah menghubungi. Ini balasan otomatis.",
-
+  "global_color": "color embed",
   "urlwebhook": [
     "url webhook 1",
     "url webhook 2",
     "url webhook 3"
   ],
   "logbot": "log status bot",
-  "mongo_backup_enabled": true,
+  "mongo_backup_enabled": true, // jika tidak ingin backup
   "midtrans": {
     "server_key": "",
-    "client_key": ""
+    "client_key": "" //(midtrans konfigurasi kalian)
   },
   "shop": {
     "log_webhook": "log webhook shop buy"
