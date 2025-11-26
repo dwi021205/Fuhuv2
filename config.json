@@ -5,17 +5,17 @@
   "global_img_url": "iamge banner",
   "global_footer_icon": "footer banner",
   "global_footer": "footer name",
-  "global_color": "color embed",
+  "global_color": "0",
   "urlwebhook": [
     "url webhook 1",
     "url webhook 2",
     "url webhook 3"
   ],
   "logbot": "log status bot",
-  "mongo_backup_enabled": true, // jika tidak ingin backup
+  "mongo_backup_enabled": true, 
   "midtrans": {
     "server_key": "",
-    "client_key": "" //(midtrans konfigurasi kalian)
+    "client_key": "", 
   },
   "shop": {
     "log_webhook": "log webhook shop buy"
